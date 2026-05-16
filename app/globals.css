@@ -1,0 +1,23 @@
+@import "tailwindcss";
+@import "@fontsource/inter";
+@import "@fontsource/space-grotesk";
+
+@theme {
+  --color-brand-red: #D04830;
+  --color-brand-amber: #D09048;
+  --color-brand-cream: #E8D8C0;
+  --color-brand-dark: #202028;
+  --color-brand-bronze: #B06028;
+
+  --font-heading: "Space Grotesk", sans-serif;
+  --font-body: "Inter", sans-serif;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  background-color: var(--color-brand-dark);
+  color: var(--color-brand-cream);
+}
