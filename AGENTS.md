@@ -48,6 +48,9 @@ trivia-guild-website/
 │   ├── page.tsx            # Landing page — Hero, About, Media, Contact, Footer
 │   ├── globals.css         # Brand tokens, fonts, base styles
 │   ├── favicon.ico         # Site favicon
+│   ├── actions/            # Server Actions for secure backend operations
+│   │   ├── auth.ts         # Login/logout and session cookie management
+│   │   └── admin.ts        # Destructive DB operations using Service Role key
 │   ├── components/
 │   │   ├── Navbar.tsx      # Fixed top navbar with scroll-based active tab detection
 │   │   ├── Footer.tsx      # Shared footer — logo, social icons, copyright
@@ -55,12 +58,15 @@ trivia-guild-website/
 │   ├── events/
 │   │   └── page.tsx        # Event details + registration/waitlist forms (fetches from Supabase)
 │   └── admin/
-│       └── page.tsx        # Admin dashboard — password gate, event config, registrations, archive
+│       ├── page.tsx        # Admin dashboard (Protected) — event config, registrations, archive
+│       └── login/page.tsx  # Admin login page
 ├── lib/
-│   └── supabase.ts         # Supabase client singleton (uses env vars)
+│   ├── supabase.ts         # Supabase client singleton (uses anon key, safe for public reads)
+│   └── supabase-admin.ts   # Secure Supabase client (uses service role key, DO NOT EXPOSE to client)
+├── middleware.ts           # Next.js middleware to protect /admin routes
 ├── public/
 │   └── images/
-│       └── triviaguildlogonobackground.png  # Brand logo (317KB PNG)
+│       └── triviaguildlogonobackground.png  # Brand logo
 ├── .env.local              # Secrets — NEVER commit (gitignored)
 ├── .env.example            # Template for env vars (safe to commit)
 ├── AGENTS.md               # This file
@@ -77,9 +83,9 @@ trivia-guild-website/
 | File | Why it's fragile |
 |---|---|
 | `Navbar.tsx` | Scroll detection logic uses `getBoundingClientRect()` — depends on `#contact` section existing on `/` |
-| `admin/page.tsx` | 700+ line monolith — complex state management, multiple Supabase operations, archive workflow is multi-step |
+| `app/actions/admin.ts` | Server actions containing multi-step database transactions (like archiving) |
 | `globals.css` | All brand tokens defined here — changing values affects entire site |
-| `lib/supabase.ts` | Single export used by every data-fetching component — do not rename |
+| `lib/supabase-admin.ts` | Highly privileged DB client. NEVER import into client components. |
 
 ## Brand System
 
@@ -118,8 +124,8 @@ trivia-guild-website/
 | event_name | text | Set from current event title |
 
 **Written by:** `/events` registration form (anon role)
-**Read by:** `/admin` dashboard (anon role — see security notes)
-**Deleted by:** `/admin` (single delete + bulk delete on archive)
+**Read by:** `/admin` dashboard (anon role)
+**Deleted by:** `app/actions/admin.ts` (service role)
 
 ### Table: `event_config`
 | Column | Type | Notes |
@@ -132,8 +138,8 @@ trivia-guild-website/
 | event_venue | text | e.g. "The Pub" |
 | event_status | text | `'open'` or `'sold_out'` |
 
-**Written by:** `/admin` save config (upsert id=1)
-**Read by:** `/events` page on mount, `/admin` on auth
+**Written by:** `app/actions/admin.ts` (service role)
+**Read by:** `/events` page, `/admin` dashboard (anon role)
 
 ### Table: `past_events`
 | Column | Type | Notes |
@@ -147,9 +153,9 @@ trivia-guild-website/
 | registrations_data | jsonb | Full array of registration objects |
 | total_teams | integer | Count at time of archive |
 
-**Written by:** `/admin` archive operation
-**Read by:** `/admin` past events section
-**Deleted by:** `/admin` individual past event delete
+**Written by:** `app/actions/admin.ts` archive operation (service role)
+**Read by:** `/admin` past events section (anon role)
+**Deleted by:** `app/actions/admin.ts` (service role)
 
 ### Table: `waitlist`
 | Column | Type | Notes |
@@ -159,31 +165,15 @@ trivia-guild-website/
 | name | text | User's name |
 | contact | text | Phone or email |
 
-**Written by:** `/events` waitlist form (when status is sold_out)
-**Read by:** Not currently displayed anywhere — check Supabase dashboard
+**Written by:** `/events` waitlist form (anon role)
 
-**Required SQL to create (if not exists):**
-```sql
-CREATE TABLE IF NOT EXISTS waitlist (
-  id BIGSERIAL PRIMARY KEY,
-  name TEXT NOT NULL,
-  contact TEXT NOT NULL,
-  created_at TIMESTAMPTZ DEFAULT NOW()
-);
-```
+## Security Architecture
 
-## External Integrations
-
-### Supabase
-- **Client:** `lib/supabase.ts` exports `supabase` singleton
-- **Credentials:** `NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_ANON_KEY` from `.env.local`
-- **Role:** Uses `anon` key (public access) — RLS policies control permissions
-
-### EmailJS
-- **Component:** `app/components/ContactForm.tsx`
-- **Credentials:** Three env vars: `NEXT_PUBLIC_EMAILJS_SERVICE_ID`, `NEXT_PUBLIC_EMAILJS_TEMPLATE_ID`, `NEXT_PUBLIC_EMAILJS_PUBLIC_KEY`
-- **Template variables sent:** `from_name`, `reply_to`, `subject`, `message`
-- **On failure:** Shows Greek error message, logs to console
+We strictly separate client and server capabilities.
+1. **Public/Anon Client (`lib/supabase.ts`)**: Used ONLY in React components for **reading** public data (`event_config`, `past_events`) or inserting into public queues (`registrations`, `waitlist`).
+2. **Admin Server Client (`lib/supabase-admin.ts`)**: Used ONLY in Server Actions for **destructive/sensitive operations**. Bypasses RLS entirely using `SUPABASE_SERVICE_ROLE_KEY`.
+3. **Authentication**: Admin auth is managed via `app/actions/auth.ts`. On correct password, a secure `admin_session` HTTP-only cookie is set.
+4. **Middleware Protection**: `middleware.ts` intercepts all requests to `/admin` (except `/admin/login`) and enforces the session cookie.
 
 ## Environment Variables
 
@@ -194,61 +184,22 @@ CREATE TABLE IF NOT EXISTS waitlist (
 | `NEXT_PUBLIC_EMAILJS_SERVICE_ID` | Yes | EmailJS service identifier |
 | `NEXT_PUBLIC_EMAILJS_TEMPLATE_ID` | Yes | EmailJS email template identifier |
 | `NEXT_PUBLIC_EMAILJS_PUBLIC_KEY` | Yes | EmailJS public API key |
-| `ADMIN_PASSWORD` | **No** | Admin dashboard login password (server-side only) |
-
-**Note:** `NEXT_PUBLIC_` vars are embedded in client bundles. `ADMIN_PASSWORD` has no prefix and should only be available server-side. However, the current admin auth is client-side — see security notes.
-
-## Page-by-Page Guide
-
-### `/` — Landing Page (`app/page.tsx`)
-- **Server Component** (no "use client")
-- Renders: Hero section (logo, title, tagline, CTA button), About placeholder, Media placeholder, Contact section with `<ContactForm />`, `<Footer />`
-- **Data:** None fetched — static content
-- **Fragile:** The `#contact` section must keep `id="contact"` — the Navbar scroll detection depends on it
-
-### `/events` — Events & Registration (`app/events/page.tsx`)
-- **Client Component** ("use client")
-- On mount: fetches event config from Supabase `event_config` table
-- Shows loading spinner while fetching
-- If status is `"open"`: displays registration form → saves to `registrations` table
-- If status is `"sold_out"`: displays SOLD OUT badge + waitlist form → saves to `waitlist` table
-- **Validation:** Team name (1-50 chars), team size (1-8), phone (digits only, 10+ chars)
-- **Re-use:** After successful registration, submit re-enables after 5 seconds
-
-### `/admin` — Admin Dashboard (`app/admin/page.tsx`)
-- **Client Component** ("use client")
-- **Password gate:** Checks input against `ADMIN_PASSWORD` constant
-- On auth: fetches event config from `event_config`, fetches `registrations`, fetches `past_events`
-- **Section A:** Event config form → upserts to `event_config` (id=1)
-- **Section B:** Registrations list with individual delete, CSV export, refresh
-- **Section C:** Past events history with collapsible cards, CSV download, delete
-- **Archive flow:** Fetch all registrations → insert into `past_events` → delete all `registrations` → reset config dates
-- **Security:** Client-side password only — not secure for sensitive data
-
-## Admin Dashboard Guide
-
-1. **Access:** Navigate to `/admin`, enter password from `ADMIN_PASSWORD` env var
-2. **Change event details:** Edit fields, click "Αποθήκευση" → upserts to Supabase `event_config`
-3. **Toggle status:** Click OPEN or SOLD OUT, then save → changes what form visitors see on `/events`
-4. **Archive event:** Click "Αρχειοθέτηση Event 📦" → confirms → archives registrations to `past_events`, clears current registrations, resets date/time
-5. **Export data:** Click "Εξαγωγή CSV" for current registrations or "Λήψη CSV" for past events
-6. **Security note:** Admin auth is client-side only — do not store truly sensitive data beyond event management
+| `ADMIN_PASSWORD` | **No** | Server-side only: Admin dashboard login password |
+| `SUPABASE_SERVICE_ROLE_KEY` | **No** | Server-side only: Supabase super-user key |
 
 ## DO NOT Rules
 
 > **Hard limits for all agents. Violating these can break the site.**
 
-1. **DO NOT** change brand colors without explicit user instruction
-2. **DO NOT** remove the `"use client"` directive from client components
-3. **DO NOT** delete `lib/supabase.ts` or change the export name `supabase`
-4. **DO NOT** change Supabase table names or column names without updating ALL references
-5. **DO NOT** commit `.env.local` to git
-6. **DO NOT** use `localStorage` for any data that needs to persist across devices
-7. **DO NOT** add new dependencies without checking if existing ones cover the use case
-8. **DO NOT** modify the admin password in source code — it lives in `.env.local` only
-9. **DO NOT** add navigation links to `/admin` from any public-facing page
-10. **DO NOT** remove `id="contact"` from the contact section in `app/page.tsx` — Navbar depends on it
-11. **DO NOT** change the Supabase `event_config` upsert to use any id other than `1`
+1. **DO NOT** change brand colors without explicit user instruction.
+2. **DO NOT** import `lib/supabase-admin.ts` or any Server Actions from `app/actions/*` into a Client Component without using standard form/button action patterns.
+3. **DO NOT** commit `.env.local` to git.
+4. **DO NOT** use `localStorage` for any data that needs to persist across devices.
+5. **DO NOT** add new dependencies without checking if existing ones cover the use case.
+6. **DO NOT** add navigation links to `/admin` from any public-facing page.
+7. **DO NOT** remove `id="contact"` from the contact section in `app/page.tsx` — Navbar depends on it.
+8. **DO NOT** change the Supabase `event_config` upsert to use any id other than `1`.
+9. **DO NOT** attempt to make destructive database calls directly from the browser using the anon key. Always proxy through a secure Server Action.
 
 ## Verification Checklist
 
@@ -256,10 +207,9 @@ CREATE TABLE IF NOT EXISTS waitlist (
 
 - [ ] `npm run dev` starts without errors
 - [ ] `localhost:3000` loads hero, scrolls to contact form, footer visible
-- [ ] `localhost:3000/events` loads event details from Supabase (not defaults)
-- [ ] `localhost:3000/admin` password gate works, dashboard loads registrations
-- [ ] Admin status toggle saves to Supabase and reflects on `/events` after refresh
-- [ ] Contact form submits and sends email (check EmailJS dashboard)
-- [ ] Registration form saves to Supabase `registrations` table
+- [ ] `localhost:3000/events` loads event details from Supabase
+- [ ] `localhost:3000/admin` redirects to `/admin/login` if not logged in
+- [ ] `/admin/login` successfully sets a cookie and redirects to dashboard
+- [ ] Admin dashboard data mutations (save config, delete, archive) work successfully
 - [ ] Mobile view (narrow browser ~375px) has no horizontal overflow
 - [ ] `npm run build` completes without TypeScript errors

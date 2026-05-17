@@ -1,11 +1,14 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
-import Image from "next/image";
 import { supabase } from "@/lib/supabase";
-
-// Admin password loaded from server-side env var via .env.local
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "tgadmin2025";
+import { logout } from "@/app/actions/auth";
+import { 
+  saveEventConfig, 
+  deleteRegistration as deleteRegAction, 
+  deletePastEvent as deletePastAction,
+  archiveEvent as archiveEventAction
+} from "@/app/actions/admin";
 
 interface Registration {
   id: number;
@@ -29,10 +32,6 @@ interface PastEvent {
 }
 
 export default function AdminPage() {
-  const [isAuthenticated, setIsAuthenticated] = useState(false);
-  const [password, setPassword] = useState("");
-  const [passwordError, setPasswordError] = useState(false);
-
   // Event config state
   const [eventTitle, setEventTitle] = useState("Quiz Night");
   const [eventDate, setEventDate] = useState("");
@@ -59,22 +58,7 @@ export default function AdminPage() {
   const [loadingPastEvents, setLoadingPastEvents] = useState(false);
   const [expandedPastEvent, setExpandedPastEvent] = useState<number | null>(null);
 
-  const handleLogin = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (password === ADMIN_PASSWORD) {
-      setIsAuthenticated(true);
-      setPasswordError(false);
-    } else {
-      setPasswordError(true);
-    }
-  };
-
-  const handleLogout = () => {
-    setIsAuthenticated(false);
-    setPassword("");
-  };
-
-  // Load config from Supabase event_config table on auth
+  // Load config from Supabase event_config table
   const fetchEventConfig = useCallback(async () => {
     const { data, error } = await supabase
       .from("event_config")
@@ -91,34 +75,6 @@ export default function AdminPage() {
       setEventStatus((data.event_status as "open" | "sold_out") || "open");
     }
   }, []);
-
-  useEffect(() => {
-    if (isAuthenticated) {
-      fetchEventConfig();
-    }
-  }, [isAuthenticated, fetchEventConfig]);
-
-  const saveConfig = async () => {
-    setConfigError("");
-    try {
-      const { error } = await supabase.from("event_config").upsert({
-        id: 1,
-        event_title: eventTitle,
-        event_date: eventDate,
-        event_time: eventTime,
-        event_venue: eventVenue,
-        event_status: eventStatus,
-      });
-      if (error) throw error;
-      setConfigSaved(true);
-      setTimeout(() => setConfigSaved(false), 2000);
-    } catch (err) {
-      const errMsg = err instanceof Error ? err.message : JSON.stringify(err);
-      console.error("Config save failed:", errMsg);
-      setConfigError("Αποτυχία αποθήκευσης. Δοκίμασε ξανά.");
-      setTimeout(() => setConfigError(""), 4000);
-    }
-  };
 
   const fetchRegistrations = useCallback(async () => {
     setLoadingRegs(true);
@@ -147,28 +103,42 @@ export default function AdminPage() {
   }, []);
 
   useEffect(() => {
-    if (isAuthenticated) {
-      fetchRegistrations();
-      fetchPastEvents();
+    fetchEventConfig();
+    fetchRegistrations();
+    fetchPastEvents();
+  }, [fetchEventConfig, fetchRegistrations, fetchPastEvents]);
+
+  const saveConfig = async () => {
+    setConfigError("");
+    try {
+      await saveEventConfig({
+        eventTitle,
+        eventDate,
+        eventTime,
+        eventVenue,
+        eventStatus
+      });
+      setConfigSaved(true);
+      setTimeout(() => setConfigSaved(false), 2000);
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : JSON.stringify(err);
+      console.error("Config save failed:", errMsg);
+      setConfigError("Αποτυχία αποθήκευσης: " + errMsg);
+      setTimeout(() => setConfigError(""), 4000);
     }
-  }, [isAuthenticated, fetchRegistrations, fetchPastEvents]);
+  };
 
   const deleteRegistration = async (id: number) => {
-    const confirmed = window.confirm(
-      "Σίγουρα θέλεις να διαγράψεις αυτή την εγγραφή;"
-    );
+    const confirmed = window.confirm("Σίγουρα θέλεις να διαγράψεις αυτή την εγγραφή;");
     if (!confirmed) return;
 
-    const { error } = await supabase
-      .from("registrations")
-      .delete()
-      .eq("id", id);
-
-    if (!error) {
+    try {
+      await deleteRegAction(id);
       setRegistrations((prev) => prev.filter((r) => r.id !== id));
       setDeleteRegError("");
-    } else {
-      setDeleteRegError("Αποτυχία διαγραφής. Δοκίμασε ξανά.");
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : "Άγνωστο σφάλμα";
+      setDeleteRegError("Αποτυχία διαγραφής: " + errMsg);
       setTimeout(() => setDeleteRegError(""), 4000);
     }
   };
@@ -183,67 +153,27 @@ export default function AdminPage() {
     setArchiveMessage("");
 
     try {
-      // 1. Fetch ALL current registrations
-      const { data: allRegs, error: fetchError } = await supabase
-        .from("registrations")
-        .select("*")
-        .order("created_at", { ascending: false });
-
-      if (fetchError) throw fetchError;
-
-      // Use current state values (loaded from Supabase event_config)
-      const currentTitle = eventTitle;
-      const currentDate = eventDate;
-      const currentTime = eventTime;
-      const currentVenue = eventVenue;
-
-      // 2. Save to past_events
-      const { error: insertError } = await supabase
-        .from("past_events")
-        .insert({
-          event_title: currentTitle,
-          event_date: currentDate,
-          event_time: currentTime,
-          event_venue: currentVenue,
-          registrations_data: allRegs || [],
-          total_teams: allRegs ? allRegs.length : 0,
-        });
-
-      if (insertError) throw insertError;
-
-      // 3. Delete ALL registrations
-      // Deletes all rows — Supabase requires a filter, gte("id", 0) matches all valid IDs
-      const { error: deleteError } = await supabase
-        .from("registrations")
-        .delete()
-        .gte("id", 0);
-
-      if (deleteError) throw deleteError;
-
-      // 4. Clear date and time in Supabase config (keep title and venue)
-      await supabase.from("event_config").upsert({
-        id: 1,
-        event_title: currentTitle,
-        event_date: "",
-        event_time: "",
-        event_venue: currentVenue,
-        event_status: "open",
+      await archiveEventAction({
+        eventTitle,
+        eventDate,
+        eventTime,
+        eventVenue
       });
+
+      // Clear local date and time state
       setEventDate("");
       setEventTime("");
 
-      // 5. Refresh registrations (now empty)
+      // Refresh data
       setRegistrations([]);
-
-      // 6. Refresh past events list
       await fetchPastEvents();
 
-      // 7. Show success message
       setArchiveMessage("Το event αρχειοθετήθηκε επιτυχώς ✅");
       setTimeout(() => setArchiveMessage(""), 4000);
     } catch (err) {
+      const errMsg = err instanceof Error ? err.message : "Άγνωστο σφάλμα";
       console.error("Archive failed:", err);
-      setArchiveMessage("Σφάλμα κατά την αρχειοθέτηση ❌");
+      setArchiveMessage("Σφάλμα: " + errMsg);
       setTimeout(() => setArchiveMessage(""), 4000);
     } finally {
       setIsArchiving(false);
@@ -256,17 +186,14 @@ export default function AdminPage() {
     );
     if (!confirmed) return;
 
-    const { error } = await supabase
-      .from("past_events")
-      .delete()
-      .eq("id", id);
-
-    if (!error) {
+    try {
+      await deletePastAction(id);
       setPastEvents((prev) => prev.filter((e) => e.id !== id));
       if (expandedPastEvent === id) setExpandedPastEvent(null);
       setDeletePastError("");
-    } else {
-      setDeletePastError("Αποτυχία διαγραφής. Δοκίμασε ξανά.");
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : "Άγνωστο σφάλμα";
+      setDeletePastError("Αποτυχία διαγραφής: " + errMsg);
       setTimeout(() => setDeletePastError(""), 4000);
     }
   };
@@ -335,60 +262,6 @@ export default function AdminPage() {
     URL.revokeObjectURL(url);
   };
 
-  // ─── PASSWORD GATE ───
-  if (!isAuthenticated) {
-    return (
-      <div className="relative flex flex-col flex-1 w-full min-h-screen">
-        <div
-          className="absolute inset-0 pointer-events-none -z-10"
-          style={{
-            background:
-              "radial-gradient(circle at center, #1a1612 0%, var(--color-brand-dark) 70%)",
-          }}
-        />
-        <div className="flex-1 flex items-center justify-center px-6">
-          <div className="w-full max-w-[400px] bg-[#2A2A33] border border-brand-bronze/30 rounded-2xl p-8 shadow-xl">
-            <div className="flex justify-center mb-6">
-              <Image
-                src="/images/triviaguildlogonobackground.png"
-                alt="Trivia Guild Logo"
-                width={80}
-                height={80}
-                className="drop-shadow-[0_0_15px_var(--color-brand-amber)]"
-              />
-            </div>
-            <h1 className="text-2xl font-heading font-bold text-brand-amber mb-6 text-center">
-              Admin
-            </h1>
-            <form onSubmit={handleLogin} className="flex flex-col gap-4">
-              <input
-                type="password"
-                value={password}
-                onChange={(e) => {
-                  setPassword(e.target.value);
-                  setPasswordError(false);
-                }}
-                placeholder="Κωδικός..."
-                className="w-full h-12 bg-brand-dark border border-brand-bronze/30 rounded-lg px-4 text-brand-cream font-body focus:outline-none focus:border-brand-amber focus:ring-1 focus:ring-brand-amber transition-colors"
-              />
-              {passwordError && (
-                <p className="text-brand-red text-sm font-body text-center">
-                  Λάθος κωδικός
-                </p>
-              )}
-              <button
-                type="submit"
-                className="w-full bg-brand-dark text-brand-amber font-bold font-body text-lg px-8 py-3 rounded-full transition-all drop-shadow-[0_0_18px_var(--color-brand-amber)] hover:drop-shadow-[0_0_28px_var(--color-brand-amber)] hover:scale-105 active:scale-95"
-              >
-                Είσοδος
-              </button>
-            </form>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
   // ─── DASHBOARD ───
   return (
     <div className="relative flex flex-col flex-1 w-full min-h-screen">
@@ -407,7 +280,7 @@ export default function AdminPage() {
             Admin Dashboard
           </h1>
           <button
-            onClick={handleLogout}
+            onClick={() => logout()}
             className="text-brand-cream/60 hover:text-brand-red font-body text-sm font-medium transition-colors"
           >
             Έξοδος
@@ -644,7 +517,6 @@ export default function AdminPage() {
                   key={pe.id}
                   className="bg-brand-dark/60 border border-brand-bronze/20 rounded-xl overflow-hidden"
                 >
-                  {/* Collapsible Header — div to avoid nested <button> HTML violation */}
                   <div
                     role="button"
                     tabIndex={0}
@@ -689,7 +561,6 @@ export default function AdminPage() {
                     </div>
                   </div>
 
-                  {/* Expanded Content */}
                   {expandedPastEvent === pe.id && (
                     <div className="border-t border-brand-bronze/20 p-5">
                       {pe.registrations_data &&
